@@ -57,16 +57,27 @@ export async function POST(req: Request) {
   };
 
   try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+    let data: { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> } | null = null;
+    let lastError = '';
+    // Retry on transient provider errors (429/500/503 overload spikes).
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) { data = await res.json(); break; }
       const detail = (await res.text()).slice(0, 300);
-      return Response.json({ reply: `Gemini request failed (${res.status}): ${detail}` }, { status: 502 });
+      lastError = `Gemini request failed (${res.status}): ${detail}`;
+      const transient = res.status === 429 || res.status === 500 || res.status === 503;
+      if (transient && attempt < 2) {
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+      break;
     }
-    const data = await res.json();
+    if (!data) return Response.json({ reply: lastError || 'The AI provider returned no data.' }, { status: 502 });
     const text: string = (data?.candidates?.[0]?.content?.parts ?? [])
       .map((p: { text?: string }) => p?.text ?? '')
       .join('');
