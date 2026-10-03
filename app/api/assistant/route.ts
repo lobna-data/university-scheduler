@@ -1,4 +1,16 @@
-const MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+// Route config: allow up to 60s so the retry/fallback chain can run.
+export const maxDuration = 60;
+
+// Primary model + stable fallbacks. If the primary is overloaded (503/429) or
+// missing (404), the assistant automatically falls back to the next model.
+// Google's recommendation for new projects: 3.8 Flash / 3.5 Flash-Lite.
+const MODELS = [
+  process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+].filter((m, i, a) => a.indexOf(m) === i);
 
 const SYS = `You are SchedulAI, a scheduling assistant for university staff.
 You receive the current scheduling data (teachers, modules, groups, rooms, sessions) as JSON, plus a staff request.
@@ -57,25 +69,33 @@ export async function POST(req: Request) {
   };
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
     let data: { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> } | null = null;
     let lastError = '';
-    // Retry on transient provider errors (429/500/503 overload spikes).
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify(payload),
-      });
-      if (res.ok) { data = await res.json(); break; }
-      const detail = (await res.text()).slice(0, 300);
-      lastError = `Gemini request failed (${res.status}): ${detail}`;
-      const transient = res.status === 429 || res.status === 500 || res.status === 503;
-      if (transient && attempt < 2) {
-        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
-        continue;
+    // Walk the model chain: primary gets 2 tries (transient spikes), each
+    // fallback gets 1. 404 -> next model; 429/500/503 -> retry then next model;
+    // other errors (400/401/403...) -> stop, fallbacks would fail the same way.
+    chain: for (let mi = 0; mi < MODELS.length; mi++) {
+      const model = MODELS[mi];
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+      const tries = mi === 0 ? 2 : 1;
+      for (let attempt = 0; attempt < tries; attempt++) {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) { data = await res.json(); break chain; }
+        const detail = (await res.text()).slice(0, 300);
+        lastError = `Gemini request failed (${res.status} on ${model}): ${detail}`;
+        const transient = res.status === 429 || res.status === 500 || res.status === 503;
+        if (res.status === 404) break; // model gone -> try next
+        if (transient && attempt < tries - 1) {
+          await new Promise((r) => setTimeout(r, 1200));
+          continue;
+        }
+        if (transient) break; // retries exhausted -> try next model
+        break chain; // non-retryable error
       }
-      break;
     }
     if (!data) return Response.json({ reply: lastError || 'The AI provider returned no data.' }, { status: 502 });
     const text: string = (data?.candidates?.[0]?.content?.parts ?? [])
