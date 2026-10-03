@@ -1,4 +1,4 @@
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
 const SYS = `You are SchedulAI, a scheduling assistant for university staff.
 You receive the current scheduling data (teachers, modules, groups, rooms, sessions) as JSON, plus a staff request.
